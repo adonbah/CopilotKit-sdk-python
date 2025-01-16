@@ -1,7 +1,6 @@
 """LangGraph agent for CopilotKit"""
 
 import uuid
-import json
 from typing import Optional, List, Callable, Any, cast, Union, TypedDict
 from typing_extensions import NotRequired
 
@@ -9,12 +8,11 @@ from langgraph.graph.graph import CompiledGraph
 from langchain.load.dump import dumps as langchain_dumps
 from langchain.schema import BaseMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig, ensure_config
-from langchain_core.messages import AIMessage, ToolMessage
 
 from partialjson.json_parser import JSONParser
 
 from .types import Message
-from .langchain import copilotkit_messages_to_langchain
+from .langchain import copilotkit_messages_to_langchain, langchain_messages_to_copilotkit
 from .action import ActionDict
 from .agent import Agent
 from .logging import get_logger
@@ -38,77 +36,13 @@ def langgraph_default_merge_state( # pylint: disable=unused-argument
         # remove system message
         messages = messages[1:]
 
-
-    # merge with existing messages
-    merged_messages = state.get("messages", [])
-    existing_message_ids = {message.id for message in merged_messages}
-    existing_tool_call_results = set()
-
-    for message in merged_messages:
-        if isinstance(message, ToolMessage):
-            existing_tool_call_results.add(message.tool_call_id)
-
-    for message in messages:
-        # filter tool calls to activate the agent itself
-        if (
-            isinstance(message, AIMessage) and
-            message.tool_calls and
-            message.tool_calls[0]["name"] == agent_name
-        ):
-            continue
-
-        # filter results from activating the agent
-        if (
-            isinstance(message, ToolMessage) and
-            message.name == agent_name
-        ):
-            continue
-
-        if message.id not in existing_message_ids:
-
-            # skip duplicate tool call results
-            if (isinstance(message, ToolMessage) and
-                message.tool_call_id in existing_tool_call_results):
-                logger.warning(
-                    "Warning: Duplicate tool call result, skipping: %s",
-                    message.tool_call_id
-                )
-                continue
-
-            merged_messages.append(message)
-        else:
-            # Replace the message with the existing one
-            for i, existing_message in enumerate(merged_messages):
-                if existing_message.id == message.id:
-                    # if the message is an AIMessage, we need to merge
-                    # the tool calls and additional kwargs
-                    if isinstance(message, AIMessage):
-                        if (
-                            (merged_messages[i].tool_calls or
-                             merged_messages[i].additional_kwargs) and
-                            merged_messages[i].content
-                        ):
-                            message.tool_calls = merged_messages[i].tool_calls
-                            message.additional_kwargs = merged_messages[i].additional_kwargs
-                    merged_messages[i] = message
-
-    # fix wrong tool call ids
-    for i, current_message in enumerate(merged_messages):
-        if i == len(merged_messages) - 1:
-            break
-        next_message = merged_messages[i + 1]
-        if (not isinstance(current_message, AIMessage) or
-            not isinstance(next_message, ToolMessage)):
-            continue
-
-        if current_message.tool_calls and current_message.tool_calls[0]["id"]:
-            next_message.tool_call_id = current_message.tool_calls[0]["id"]
-
-
+    existing_messages = state.get("messages", [])
+    existing_message_ids = {message.id for message in existing_messages}
+    new_messages = [message for message in messages if message.id not in existing_message_ids]
 
     return {
         **state,
-        "messages": merged_messages,
+        "messages": new_messages,
         "copilotkit": {
             "actions": actions
         }
@@ -141,7 +75,7 @@ class LangGraphAgent(Agent):
 
         if merge_state is None:
             logger.warning("Warning: merge_state is deprecated, use copilotkit_config instead")
-        
+
         if graph is None and agent is None:
             raise ValueError("graph must be provided")
 
@@ -177,11 +111,19 @@ class LangGraphAgent(Agent):
             node_name: str,
             state: dict,
             running: bool,
-            active: bool
+            active: bool,
+            include_messages: bool = False
         ):
-        state_without_messages = {
-            k: v for k, v in state.items() if k != "messages"
-        }
+        if not include_messages:
+            state = {
+                k: v for k, v in state.items() if k != "messages"
+            }
+        else:
+            state = {
+                **state,
+                "messages": langchain_messages_to_copilotkit(state.get("messages", []))
+            }
+
         return langchain_dumps({
             "event": "on_copilotkit_state_sync",
             "thread_id": thread_id,
@@ -189,7 +131,7 @@ class LangGraphAgent(Agent):
             "agent_name": self.name,
             "node_name": node_name,
             "active": active,
-            "state": state_without_messages,
+            "state": state,
             "running": running,
             "role": "assistant"
         })
@@ -203,6 +145,7 @@ class LangGraphAgent(Agent):
         node_name: Optional[str] = None,
         actions: Optional[List[ActionDict]] = None,
     ):
+
         config = ensure_config(cast(Any, self.langgraph_config.copy()) if self.langgraph_config else {}) # pylint: disable=line-too-long
         config["configurable"] = config.get("configurable", {})
         config["configurable"]["thread_id"] = thread_id
@@ -246,20 +189,26 @@ class LangGraphAgent(Agent):
         prev_node_name = None
         emit_intermediate_state_until_end = None
         should_exit = False
+        manually_emitted_state = None
         thread_id = cast(Any, config)["configurable"]["thread_id"]
 
-        async for event in self.graph.astream_events(initial_state, config, version="v1"):
+        async for event in self.graph.astream_events(initial_state, config, version="v2"):
             current_node_name = event.get("name")
             event_type = event.get("event")
             run_id = event.get("run_id")
             metadata = event.get("metadata", {})
 
-            should_exit = should_exit or metadata.get("copilotkit:exit", False)
+            should_exit = should_exit or (
+                event_type == "on_custom_event" and
+                event["name"] == "copilotkit_exit"
+            )
 
             emit_intermediate_state = metadata.get("copilotkit:emit-intermediate-state")
-            force_emit_intermediate_state = metadata.get("copilotkit:force-emit-intermediate-state", False) # pylint: disable=line-too-long
-            manually_emit_message = metadata.get("copilotkit:manually-emit-message", False)
-            manually_emit_tool_call = metadata.get("copilotkit:manually-emit-tool-call", False)
+            manually_emit_intermediate_state = (
+                event_type == "on_custom_event" and
+                event["name"] == "copilotkit_manually_emit_intermediate_state"
+            )
+
 
             # we only want to update the node name under certain conditions
             # since we don't need any internal node names to be sent to the frontend
@@ -272,42 +221,21 @@ class LangGraphAgent(Agent):
 
             exiting_node = node_name == current_node_name and event_type == "on_chain_end"
 
-            if force_emit_intermediate_state:
-                if event_type == "on_chain_end":
-                    state = cast(Any, event["data"])["output"]
-                    yield self._emit_state_sync_event(
-                        thread_id=thread_id,
-                        run_id=run_id,
-                        node_name=node_name,
-                        state=state,
-                        running=True,
-                        active=True
-                    ) + "\n"
+            if exiting_node:
+                manually_emitted_state = None
+
+            if manually_emit_intermediate_state:
+                manually_emitted_state = cast(Any, event["data"])
+                yield self._emit_state_sync_event(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    node_name=node_name,
+                    state=manually_emitted_state,
+                    running=True,
+                    active=True
+                ) + "\n"
                 continue
 
-            if manually_emit_message:
-                if event_type == "on_chain_end":
-                    yield json.dumps(
-                        {
-                            "event": "on_copilotkit_emit_message",
-                            "message": cast(Any, event["data"])["output"],
-                            "message_id": str(uuid.uuid4()),
-                            "role": "assistant"
-                        }
-                    ) + "\n"
-                continue
-
-            if manually_emit_tool_call:
-                if event_type == "on_chain_end":
-                    yield json.dumps(
-                        {
-                            "event": "on_copilotkit_emit_tool_call",
-                            "name": cast(Any, event["data"])["output"]["name"],
-                            "args": cast(Any, event["data"])["output"]["args"],
-                            "id": cast(Any, event["data"])["output"]["id"]
-                        }
-                    ) + "\n"
-                continue
 
             if emit_intermediate_state and emit_intermediate_state_until_end is None:
                 emit_intermediate_state_until_end = node_name
@@ -316,7 +244,7 @@ class LangGraphAgent(Agent):
                 # reset the streaming state extractor
                 streaming_state_extractor = _StreamingStateExtractor(emit_intermediate_state)
 
-            updated_state = self.graph.get_state(config).values
+            updated_state = manually_emitted_state or (await self.graph.aget_state(config)).values
 
             if emit_intermediate_state and event_type == "on_chat_model_stream":
                 streaming_state_extractor.buffer_tool_calls(event)
@@ -328,7 +256,7 @@ class LangGraphAgent(Agent):
                 }
 
             if (not emit_intermediate_state and
-                current_node_name == emit_intermediate_state_until_end and 
+                current_node_name == emit_intermediate_state_until_end and
                 event_type == "on_chain_end"):
                 # stop emitting function call state
                 emit_intermediate_state_until_end = None
@@ -351,7 +279,7 @@ class LangGraphAgent(Agent):
 
             yield langchain_dumps(event) + "\n"
 
-        state = self.graph.get_state(config)
+        state = await self.graph.aget_state(config)
         is_end_node = state.next == ()
 
         node_name = list(state.metadata["writes"].keys())[0]
@@ -363,7 +291,9 @@ class LangGraphAgent(Agent):
             state=state.values,
             running=not should_exit,
             # at this point, the node is ending so we set active to false
-            active=False
+            active=False,
+            # sync messages at the end of the run
+            include_messages=True
         ) + "\n"
 
 
