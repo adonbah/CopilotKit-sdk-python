@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "copilotkit"
-version = "0.1.33"
+version = "0.1.33.1"
 description = "CopilotKit python SDK"
 authors = ["Markus Ecker <markus.ecker@gmail.com>"]
 license = "MIT"
@@ -11,14 +11,14 @@ keywords = ["copilot", "copilotkit", "langgraph", "langchain", "ai", "langsmith"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
-langgraph = "^0.2.50"
+langgraph = "^0.2.62"
 httpx = "^0.27.2"
-fastapi = "^0.115.0"
-langchain = "^0.3.3"
-langchain-openai = "^0.2.2"
-langchain-anthropic = "^0.2.3"
+fastapi = "^0.115.6"
+langchain = "^0.3.14"
+langchain-openai = "^0.3.0"
+langchain-anthropic = "^0.3.1"
 partialjson = "^0.0.8"
-langgraph-sdk = "^0.1.32"
+langgraph-sdk = "^0.1.51"
 toml = "^0.10.2"
 
 [build-system]
