@@ -1,12 +1,10 @@
 """Test Pirate Agent"""
 
 from typing import Any, cast
-# from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph import MessagesState
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
-# from langchain_core.messages import SystemMessage
 from copilotkit.langchain import copilotkit_emit_message
 
 class PirateAgentState(MessagesState):
